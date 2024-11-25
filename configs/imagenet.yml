@@ -1,0 +1,57 @@
+data:
+    dataset: "imagenet"
+    image_size: 256
+    kernel_size: 55
+    data_path: "test/imagenet/blurry"
+    gt_path: "test/imagenet/gt"
+    img_name: "225"
+    models_path: "./models"
+    netG_path: "./models/netG_55.pth"
+    netE_path: "./models/netE_55.pth"
+    save_path: "./results"
+
+model:
+    model_name: "imagenet"
+    model_path: "./models/256x256_diffusion_uncond.pt"
+    image_size: 256
+    num_channels: 256
+    num_res_blocks: 2
+    channel_mult: ""
+    learn_sigma: True
+    class_cond: False
+    use_checkpoint: False
+    attention_resolutions: 32,16,8
+    num_heads: 4
+    num_head_channels: 64
+    num_heads_upsample: -1
+    use_scale_shift_norm: True
+    dropout: 0.0
+    resblock_updown: True
+    use_fp16: False
+    use_new_attention_order: False
+
+diffusion:
+    beta_schedule: linear
+    beta_start: 0.0001
+    beta_end: 0.02
+    num_diffusion_timesteps: 1000
+
+sampling:
+    batch_size: 1
+    
+time_travel:
+    T_sampling: 100
+    travel_length: 1
+    travel_repeat: 1
+
+task_config:
+    seed: 0
+    num_iter: 500
+    save_frequency: 10
+
+    Denoising_steps: 10
+    #Optimization_steps: 100
+    #lr_blur: 0.0002
+    lr_img: 0.003 #0.003
+    lr_kernel: 0.0002 #5e-4
+    delta_t: 100

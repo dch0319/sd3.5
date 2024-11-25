@@ -1,0 +1,16 @@
+data:
+    dataset: "OpenImage"
+    clean_img_path: "./datasets/open_val"
+    kernel_size: 65
+    kernel_path: "./datasets/kernel/65_train.npz"
+    netG_path: "./models/netG_65.pth"
+    save_path: "./models"
+
+task_config:
+    seed: 0
+    num_epochs: 60
+    num_iters: 100
+    lr: 0.001 #0.0001
+    lr_z: 0.01 #0.01
+    batch_size: 1280 #128
+    weight_lambda: 0.1

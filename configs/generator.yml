@@ -1,0 +1,11 @@
+data:
+    dataset: "motionblur_31"
+    kernel_size: 31
+    kernel_path: "./datasets/kernel/motionblur_31.npz"
+    save_path: "./models"
+
+task_config:
+    seed: 0
+    num_epochs: 50
+    lr: 0.0002
+    batch_size: 128

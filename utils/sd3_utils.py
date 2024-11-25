@@ -1,31 +1,14 @@
-# NOTE: Must have folder `models` with the following files:
-# - `clip_g.safetensors` (openclip bigG, same as SDXL)
-# - `clip_l.safetensors` (OpenAI CLIP-L, same as SDXL)
-# - `t5xxl.safetensors` (google T5-v1.1-XXL)
-# - `sd3_medium.safetensors` (or whichever main MMDiT model file)
-# Also can have
-# - `sd3_vae.safetensors` (holds the VAE separately if needed)
-
-import datetime
 import math
 import os
 
-import fire
 import numpy as np
 import torch
-from PIL import Image
 from safetensors import safe_open
 from tqdm import tqdm
 
-import sd3_impls
-from other_impls import SD3Tokenizer, SDClipModel, SDXLClipG, T5XXLModel
-from sd3_impls import (
-    SDVAE,
-    BaseModel,
-    CFGDenoiser,
-    SD3LatentFormat,
-    SkipLayerCFGDenoiser,
-)
+from other_impls import SD3Tokenizer, T5XXLModel, SDXLClipG, SDClipModel
+from sd3_impls import SkipLayerCFGDenoiser, CFGDenoiser, SD3LatentFormat, SDVAE, BaseModel
+
 
 #################################################################################################
 ### Wrappers for model parts
@@ -36,7 +19,7 @@ def load_into(f, model, prefix, device, dtype=None):
     """Just a debugging-friendly hack to apply the weights in a safetensors file to the pytorch module."""
     for key in f.keys():
         if key.startswith(prefix) and not key.startswith("loss."):
-            path = key[len(prefix) :].split(".")
+            path = key[len(prefix):].split(".")
             obj = model
             for p in path:
                 if obj is list:
@@ -141,43 +124,28 @@ class VAE:
             load_into(f, self.model, prefix, "cpu", torch.float16)
 
 
-#################################################################################################
-### Main inference logic
-#################################################################################################
-
-
-# Note: Sigma shift value, publicly released models use 3.0
-SHIFT = 3.0
-# Naturally, adjust to the width/height of the model you have
-WIDTH = 1024
-HEIGHT = 1024
-# Pick your prompt
-PROMPT = "a photo of a cat"
-# Most models prefer the range of 4-5, but still work well around 7
-CFG_SCALE = 4.5
-# Different models want different step counts but most will be good at 50, albeit that's slow to run
-# sd3_medium is quite decent at 28 steps
-STEPS = 40
-# Seed
-SEED = 23
-SEEDTYPE = "fixed"
-# SEEDTYPE = "rand"
-# SEEDTYPE = "roll"
-# Actual model file path
-MODEL = "models/sd3_medium.safetensors"
-# MODEL = "models/sd3.5_large_turbo.safetensors"
-# MODEL = "models/sd3.5_large.safetensors"
-# VAE model file path, or set None to use the same model file
-VAEFile = None  # "models/sd3_vae.safetensors"
-# Optional init image file path
-INIT_IMAGE = None
-# If init_image is given, this is the percentage of denoising steps to run (1.0 = full denoise, 0.0 = no denoise at all)
-DENOISE = 0.6
-# Output file path
-OUTDIR = "outputs"
-# SAMPLER
-# SAMPLER = "euler"
-SAMPLER = "dpmpp_2m"
+@torch.no_grad()
+@torch.autocast("cuda", dtype=torch.float16)
+def sample_dpmpp_2m(model, x, sigmas, extra_args=None):
+    """DPM-Solver++(2M)."""
+    extra_args = {} if extra_args is None else extra_args
+    s_in = x.new_ones([x.shape[0]])
+    sigma_fn = lambda t: t.neg().exp()
+    t_fn = lambda sigma: sigma.log().neg()
+    old_denoised = None
+    for i in tqdm(range(len(sigmas) - 1)):
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
+        h = t_next - t
+        if old_denoised is None or sigmas[i + 1] == 0:
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
+        else:
+            h_last = t - t_fn(sigmas[i - 1])
+            r = h_last / h
+            denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+        old_denoised = denoised
+    return x
 
 
 class SD3Inferencer:
@@ -185,7 +153,7 @@ class SD3Inferencer:
         if self.verbose:
             print(txt)
 
-    def load(self, model=MODEL, vae=VAEFile, shift=SHIFT, verbose=False):
+    def load(self, model, vae, shift, verbose=False):
         self.verbose = verbose
         print("Loading tokenizers...")
         # NOTE: if you need a reference impl for a high performance CLIP tokenizer instead of just using the HF transformers one,
@@ -205,7 +173,7 @@ class SD3Inferencer:
         print("Models loaded.")
 
     def get_empty_latent(self, width, height):
-        self.print("Prep an empty latent...")
+        self.print("Prep an empty noise...")
         return torch.ones(1, 16, height // 8, width // 8, device="cpu") * 0.0609
 
     def get_sigmas(self, sampling, steps):
@@ -254,30 +222,27 @@ class SD3Inferencer:
         return {"c_crossattn": cond, "y": pooled}
 
     def do_sampling(
-        self,
-        latent,
-        seed,
-        conditioning,
-        neg_cond,
-        steps,
-        cfg_scale,
-        sampler="dpmpp_2m",
-        denoise=1.0,
-        skip_layer_config={},
+            self,
+            latent,
+            conditioning,
+            neg_cond,
+            steps,
+            cfg_scale,
+            sampler="dpmpp_2m",
+            denoise=1.0,
+            skip_layer_config={},
     ) -> torch.Tensor:
         self.print("Sampling...")
-        latent = latent.half().cuda()
         self.sd3.model = self.sd3.model.cuda()
-        noise = self.get_noise(seed, latent).cuda()
         sigmas = self.get_sigmas(self.sd3.model.model_sampling, steps).cuda()
-        sigmas = sigmas[int(steps * (1 - denoise)) :]
+        sigmas = sigmas[int(steps * (1 - denoise)):]
         conditioning = self.fix_cond(conditioning)
         neg_cond = self.fix_cond(neg_cond)
         extra_args = {"cond": conditioning, "uncond": neg_cond, "cond_scale": cfg_scale}
         noise_scaled = self.sd3.model.model_sampling.noise_scaling(
-            sigmas[0], noise, latent, self.max_denoise(sigmas)
+            sigmas[0], latent, noise, self.max_denoise(sigmas)
         )
-        sample_fn = getattr(sd3_impls, f"sample_{sampler}")
+        sample_fn = sample_dpmpp_2m
         denoiser = (
             SkipLayerCFGDenoiser
             if skip_layer_config.get("scale", 0) > 0
@@ -295,7 +260,7 @@ class SD3Inferencer:
         return latent
 
     def vae_encode(self, image) -> torch.Tensor:
-        self.print("Encoding image to latent...")
+        self.print("Encoding image to noise...")
         image = image.convert("RGB")
         image_np = np.array(image).astype(np.float32) / 255.0
         image_np = np.moveaxis(image_np, 2, 0)
@@ -309,173 +274,18 @@ class SD3Inferencer:
         self.print("Encoded")
         return latent
 
-    def vae_decode(self, latent) -> Image.Image:
-        self.print("Decoding latent to image...")
+    def process(self, x):
+        x = torch.clamp((x + 1.0) / 2.0, min=0.0, max=1.0)[0]
+        x = np.moveaxis(x.cpu().numpy(), 0, 2)
+        x = (x * 255.0).astype(np.uint8)  # 256,256,3
+        return x
+
+    def vae_decode(self, latent) -> torch.Tensor:
+        self.print("Decoding noise to image...")
         latent = latent.cuda()
         self.vae.model = self.vae.model.cuda()
         image = self.vae.model.decode(latent)
-        image = image.float()
+        image = image.float()  # 1,3,256,256
         self.vae.model = self.vae.model.cpu()
-        image = torch.clamp((image + 1.0) / 2.0, min=0.0, max=1.0)[0]
-        decoded_np = 255.0 * np.moveaxis(image.cpu().numpy(), 0, 2)
-        decoded_np = decoded_np.astype(np.uint8)
-        out_image = Image.fromarray(decoded_np)
         self.print("Decoded")
-        return out_image
-
-    def gen_image(
-        self,
-        prompts=[PROMPT],
-        width=WIDTH,
-        height=HEIGHT,
-        steps=STEPS,
-        cfg_scale=CFG_SCALE,
-        sampler=SAMPLER,
-        seed=SEED,
-        seed_type=SEEDTYPE,
-        out_dir=OUTDIR,
-        init_image=INIT_IMAGE,
-        denoise=DENOISE,
-        skip_layer_config={},
-    ):
-        latent = self.get_empty_latent(width, height)
-        if init_image:
-            image_data = Image.open(init_image)
-            image_data = image_data.resize((width, height), Image.LANCZOS)
-            latent = self.vae_encode(image_data)
-            latent = SD3LatentFormat().process_in(latent)
-        neg_cond = self.get_cond("")
-        seed_num = None
-        pbar = tqdm(enumerate(prompts), total=len(prompts), position=0, leave=True)
-        for i, prompt in pbar:
-            if seed_type == "roll":
-                seed_num = seed if seed_num is None else seed_num + 1
-            elif seed_type == "rand":
-                seed_num = torch.randint(0, 100000, (1,)).item()
-            else:  # fixed
-                seed_num = seed
-            conditioning = self.get_cond(prompt)
-            sampled_latent = self.do_sampling(
-                latent,
-                seed_num,
-                conditioning,
-                neg_cond,
-                steps,
-                cfg_scale,
-                sampler,
-                denoise if init_image else 1.0,
-                skip_layer_config,
-            )
-            image = self.vae_decode(sampled_latent)
-            save_path = os.path.join(out_dir, f"{i:06d}.png")
-            self.print(f"Will save to {save_path}")
-            image.save(save_path)
-            self.print("Done")
-
-
-CONFIGS = {
-    "sd3_medium": {
-        "shift": 1.0,
-        "cfg": 5.0,
-        "steps": 50,
-        "sampler": "dpmpp_2m",
-    },
-    "sd3.5_medium": {
-        "shift": 3.0,
-        "cfg": 5.0,
-        "steps": 50,
-        "sampler": "dpmpp_2m",
-        "skip_layer_config": {
-            "scale": 2.5,
-            "start": 0.01,
-            "end": 0.20,
-            "layers": [7, 8, 9],
-            "cfg": 4.0,
-        },
-    },
-    "sd3.5_large": {
-        "shift": 3.0,
-        "cfg": 4.5,
-        "steps": 40,
-        "sampler": "dpmpp_2m",
-    },
-    "sd3.5_large_turbo": {"shift": 3.0, "cfg": 1.0, "steps": 4, "sampler": "euler"},
-}
-
-
-@torch.no_grad()
-def main(
-    prompt=PROMPT,
-    model=MODEL,
-    out_dir=OUTDIR,
-    postfix=None,
-    seed=SEED,
-    seed_type=SEEDTYPE,
-    sampler=None,
-    steps=None,
-    cfg=None,
-    shift=None,
-    width=WIDTH,
-    height=HEIGHT,
-    vae=VAEFile,
-    init_image=INIT_IMAGE,
-    denoise=DENOISE,
-    skip_layer_cfg=False,
-    verbose=False,
-):
-    steps = steps or CONFIGS.get(os.path.splitext(os.path.basename(model))[0], {}).get(
-        "steps", 50
-    )
-    cfg = cfg or CONFIGS.get(os.path.splitext(os.path.basename(model))[0], {}).get(
-        "cfg", 5
-    )
-    shift = shift or CONFIGS.get(os.path.splitext(os.path.basename(model))[0], {}).get(
-        "shift", 3
-    )
-    sampler = sampler or CONFIGS.get(
-        os.path.splitext(os.path.basename(model))[0], {}
-    ).get("sampler", "dpmpp_2m")
-    if skip_layer_cfg:
-        skip_layer_config = CONFIGS.get(
-            os.path.splitext(os.path.basename(model))[0], {}
-        ).get("skip_layer_config", {})
-        cfg = skip_layer_config.get("cfg", cfg)
-    else:
-        skip_layer_config = {}
-
-    inferencer = SD3Inferencer()
-    inferencer.load(model, vae, shift, verbose)
-
-    if isinstance(prompt, str):
-        if os.path.splitext(prompt)[-1] == ".txt":
-            with open(prompt, "r") as f:
-                prompts = [l.strip() for l in f.readlines()]
-        else:
-            prompts = [prompt]
-
-    out_dir = os.path.join(
-        out_dir,
-        os.path.splitext(os.path.basename(model))[0],
-        os.path.splitext(os.path.basename(prompt))[0][:50]
-        + (postfix or datetime.datetime.now().strftime("_%Y-%m-%dT%H-%M-%S")),
-    )
-    print(f"Saving images to {out_dir}")
-    os.makedirs(out_dir, exist_ok=False)
-
-    inferencer.gen_image(
-        prompts,
-        width,
-        height,
-        steps,
-        cfg,
-        sampler,
-        seed,
-        seed_type,
-        out_dir,
-        init_image,
-        denoise,
-        skip_layer_config,
-    )
-
-
-fire.Fire(main)
+        return image

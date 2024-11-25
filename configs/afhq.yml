@@ -1,0 +1,41 @@
+data:
+  dataset: "afhq"
+  image_size: 256
+  kernel_size: 31
+  data_path: "test/afhq/blurry"
+  gt_path: "test/afhq/gt"
+  img_name: "flickr_dog_000823"
+  models_path: "models"
+  netG_path: "models/openimage/netG_31.pth"
+  netE_path: "models/openimage/netE_31.pth"
+  save_path: "results"
+
+task_config:
+  num_iter: 500
+  save_frequency: 10
+  Denoising_steps: 10
+  lr_img: 0.003 #0.003
+  lr_kernel: 0.0002 #5e-4
+  delta_t: 100
+
+sd_config:
+  SHIFT: 3.0
+  WIDTH: 256
+  HEIGHT: 256
+  PROMPT: ""
+  CFG_SCALE: 5.0
+  STEPS: 50
+  # Seed
+  SEED: 23
+  SEEDTYPE: "fixed"
+  MODEL: "models/sd3.5_medium.safetensors"
+  VAEFile: None  # "models/sd3_vae.safetensors"
+  INIT_IMAGE: None
+  DENOISE: 0.6
+  SAMPLER: "dpmpp_2m"
+  skip_layer_config:
+    scale: 2.5
+    start: 0.01
+    end: 0.20
+    layers: [ 7, 8, 9 ]
+    cfg: 4.0

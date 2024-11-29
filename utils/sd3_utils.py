@@ -124,7 +124,7 @@ class VAE:
             load_into(f, self.model, prefix, "cpu", torch.float16)
 
 
-@torch.no_grad()
+# @torch.no_grad()
 @torch.autocast("cuda", dtype=torch.float16)
 def sample_dpmpp_2m(model, x, sigmas, extra_args=None):
     """DPM-Solver++(2M)."""
@@ -173,7 +173,7 @@ class SD3Inferencer:
         print("Models loaded.")
 
     def get_empty_latent(self, width, height):
-        self.print("Prep an empty noise...")
+        self.print("Prep an empty latent...")
         return torch.ones(1, 16, height // 8, width // 8, device="cpu") * 0.0609
 
     def get_sigmas(self, sampling, steps):
@@ -186,19 +186,6 @@ class SD3Inferencer:
             sigs.append(sampling.sigma(ts))
         sigs += [0.0]
         return torch.FloatTensor(sigs)
-
-    def get_noise(self, seed, latent):
-        generator = torch.manual_seed(seed)
-        self.print(
-            f"dtype = {latent.dtype}, layout = {latent.layout}, device = {latent.device}"
-        )
-        return torch.randn(
-            latent.size(),
-            dtype=torch.float32,
-            layout=latent.layout,
-            generator=generator,
-            device="cpu",
-        ).to(latent.dtype)
 
     def get_cond(self, prompt):
         self.print("Encode prompt...")
@@ -223,7 +210,9 @@ class SD3Inferencer:
 
     def do_sampling(
             self,
-            latent,
+            noise,
+            height,
+            width,
             conditioning,
             neg_cond,
             steps,
@@ -233,34 +222,35 @@ class SD3Inferencer:
             skip_layer_config={},
     ) -> torch.Tensor:
         self.print("Sampling...")
+        latent = self.get_empty_latent(height, width)
+        latent = latent.half().cuda()  # fp32->fp16
         self.sd3.model = self.sd3.model.cuda()
         sigmas = self.get_sigmas(self.sd3.model.model_sampling, steps).cuda()
         sigmas = sigmas[int(steps * (1 - denoise)):]
-        conditioning = self.fix_cond(conditioning)
-        neg_cond = self.fix_cond(neg_cond)
+        conditioning = self.fix_cond(conditioning)  # conditioning fp32->fp16
+        neg_cond = self.fix_cond(neg_cond)  # 空conditioning fp32->fp16
         extra_args = {"cond": conditioning, "uncond": neg_cond, "cond_scale": cfg_scale}
         noise_scaled = self.sd3.model.model_sampling.noise_scaling(
-            sigmas[0], latent, noise, self.max_denoise(sigmas)
-        )
-        sample_fn = sample_dpmpp_2m
+            sigmas[0], noise, latent, self.max_denoise(sigmas)
+        )  # sigma * noise + (1.0 - sigma) * latent_image
         denoiser = (
             SkipLayerCFGDenoiser
             if skip_layer_config.get("scale", 0) > 0
             else CFGDenoiser
         )
-        latent = sample_fn(
+        latent = sample_dpmpp_2m(
             denoiser(self.sd3.model, steps, skip_layer_config),
             noise_scaled,
             sigmas,
             extra_args=extra_args,
-        )
+        )  # 和noise形状一样
         latent = SD3LatentFormat().process_out(latent)
         self.sd3.model = self.sd3.model.cpu()
         self.print("Sampling done")
         return latent
 
     def vae_encode(self, image) -> torch.Tensor:
-        self.print("Encoding image to noise...")
+        self.print("Encoding image to latent...")
         image = image.convert("RGB")
         image_np = np.array(image).astype(np.float32) / 255.0
         image_np = np.moveaxis(image_np, 2, 0)
@@ -281,7 +271,7 @@ class SD3Inferencer:
         return x
 
     def vae_decode(self, latent) -> torch.Tensor:
-        self.print("Decoding noise to image...")
+        self.print("Decoding latent to image...")
         latent = latent.cuda()
         self.vae.model = self.vae.model.cuda()
         image = self.vae.model.decode(latent)

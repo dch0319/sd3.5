@@ -32,7 +32,7 @@ parser.add_argument(
     default=r"./configs/afhq.yml",
     help="path of config file",
 )
-parser.add_argument("--use_wandb", type=bool, default=False, help="whether to use wandb")
+parser.add_argument("--use_wandb", type=bool, default=True, help="whether to use wandb")
 parser.add_argument(
     "--load_pretrain", type=bool, default=False, help="whether to load pretrain model"
 )
@@ -89,7 +89,8 @@ def main():
     ssim_loss = SSIM().type(dtype)
     # Define optimizer
     noise = torch.nn.parameter.Parameter(
-        torch.randn(1, 16, config.sd_config.HEIGHT // 8, config.sd_config.WIDTH // 8, dtype=torch.float32, ).cuda()
+        torch.randn(1, 16, config.sd_config.HEIGHT // 8, config.sd_config.WIDTH // 8, dtype=torch.float32).cuda(),
+        requires_grad=True
     )
 
     if opt.load_pretrain:
@@ -107,12 +108,15 @@ def main():
     for step in tqdm(range(1, config.task_config.num_iter + 1)):
         optimizer.zero_grad()
         sampled_latent = inferencer.do_sampling(noise=noise,
+                                                height=config.sd_config.HEIGHT,
+                                                width=config.sd_config.WIDTH,
                                                 conditioning=inferencer.get_cond(config.sd_config.PROMPT),
                                                 neg_cond=inferencer.get_cond(''),
                                                 steps=config.sd_config.STEPS,
                                                 cfg_scale=config.sd_config.CFG_SCALE,
                                                 denoise=config.sd_config.DENOISE,
-                                                skip_layer_config=vars(config.sd_config.skip_layer_config))  # (1,3,256,256)
+                                                skip_layer_config=vars(
+                                                    config.sd_config.skip_layer_config))  # (1,3,256,256)
         x_0_hat = inferencer.vae_decode(sampled_latent)
         out_k = netG.module.Gk(w)  # (1,1,31,31)
         # blurred_xt = nn.functional.conv2d(x_0_hat.view(-1, 1, config.data.image_size, config.data.image_size), out_k,

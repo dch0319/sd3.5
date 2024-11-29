@@ -14,8 +14,8 @@ task_config:
   num_iter: 500
   save_frequency: 10
   Denoising_steps: 10
-  lr_img: 0.003 #0.003
-  lr_kernel: 0.0002 #5e-4
+  lr_img: 0.003
+  lr_kernel: 0.0002
   delta_t: 100
 
 sd_config:
